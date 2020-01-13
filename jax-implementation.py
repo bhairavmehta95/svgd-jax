@@ -1,5 +1,6 @@
 import jax.numpy as np
 from jax.config import config
+from jax.experimental import optimizers
 from jax import grad, jit, vmap
 
 import numpy as npn
@@ -7,67 +8,70 @@ import numpy.matlib as nm
 
 from functools import partial
 
+def lnprob(theta):
+  return -1*np.matmul(theta-nm.repmat(mu, theta.shape[0], 1), A)
+
 def gram(kernel, xs):
   return vmap(lambda x: vmap(lambda y: kernel(x, y))(xs))(xs)
 
 def rbf(x, y):
   return np.exp(-np.sum((x - y)**2))
 
-class SVGD():
-    def __init__(self):
-        pass
-    
-    def svgd_kernel(self, theta):
-        Kxy = gram(rbf, theta)
-        dxkxy = -np.matmul(Kxy, theta)
-        sumkxy = np.sum(Kxy, axis=1, keepdims=True)
-        dxkxy = dxkxy + theta * sumkxy  
-        return (Kxy, dxkxy)
-    
+def svgd_kernel(theta):
+    Kxy = gram(rbf, theta)
+    k_grad = grad(rbf)
+    return Kxy, k_grad(theta, theta)
 
-    def update(self, x0, lnprob, n_iter = 1000, stepsize = 1e-3, bandwidth = -1, alpha = 0.9, debug = False):
-        # Check input
-        if x0 is None or lnprob is None:
-            raise ValueError('x0 or lnprob cannot be None!')
-        
-        theta = npn.copy(x0) 
-        
-        # adagrad with momentum
-        fudge_factor = 1e-6
-        historical_grad = 0
-        for iter in range(n_iter):           
-            lnpgrad = lnprob(theta)
-            # calculating the kernel matrix
-            kxy, dxkxy = self.svgd_kernel(theta)  
-            grad_theta = (np.matmul(kxy, lnpgrad) + dxkxy) / x0.shape[0]  
-            
-            # adagrad 
-            if iter == 0:
-                historical_grad = historical_grad + grad_theta ** 2
-            else:
-                historical_grad = alpha * historical_grad + (1 - alpha) * (grad_theta ** 2)
-            adj_grad = npn.divide(grad_theta, fudge_factor+np.sqrt(historical_grad))
-            theta = theta + stepsize * adj_grad 
-            
-        return theta
+@jit
+def step(i, opt_state, theta):
+    lnpgrad = lnprob(theta)
+    kxy, dxkxy = svgd_kernel(theta)
+    grad_theta = (np.matmul(kxy, lnpgrad) + dxkxy) / theta.shape[0] 
+    
+    return opt_update(i, -grad_theta, opt_state)
 
-class MVN:
-    def __init__(self, mu, A):
-        self.mu = mu
-        self.A = A
+### Parameters 
+A = np.array([[0.2260,0.1652],[0.1652,0.6779]])
+mu = np.array([-0.21,0.9010])
+x0 = npn.random.normal(0,1, [10,2]);
+
+print(mu, 'ground truth')
+
+step_size = 1e-2
+alpha = 0.9
+
+### Jax
+
+theta = npn.copy(x0)
+opt_init, opt_update, get_params = optimizers.adagrad(step_size=step_size, momentum=alpha)
+opt_state = opt_init(theta)
+
+for iter in range(1000):
+    theta = get_params(opt_state)
+    opt_state = step(iter, opt_state, theta)
+
+print(np.mean(get_params(opt_state), axis=0), 'jax')
+
+### Manual Adagrad 
+
+theta = npn.copy(x0)
+fudge_factor = 1e-6
+historical_grad = 0
+
+for iter in range(1000):     
+    lnpgrad = lnprob(theta)
+    # calculating the kernel matrix
+    kxy, dxkxy = svgd_kernel(theta)  
+    grad_theta = (np.matmul(kxy, lnpgrad) + dxkxy) / x0.shape[0]
+
+    # if iter % 100 == 0: print(np.mean(theta, axis=0))
     
-    def dlnprob(self, theta):
-        return -1*np.matmul(theta-nm.repmat(self.mu, theta.shape[0], 1), self.A)
-    
-if __name__ == '__main__':
-    A = np.array([[0.2260,0.1652],[0.1652,0.6779]])
-    mu = np.array([-0.6871,0.8010])
-    
-    model = MVN(mu, A)
-    
-    x0 = npn.random.normal(0,1, [10,2]);
-    theta = SVGD().update(x0, model.dlnprob, n_iter=1000, stepsize=0.01)
-    
-    print ("ground truth: ", mu)
-    print ("svgd: ", np.mean(theta,axis=0))
-    
+    # adagrad 
+    if iter == 0:
+        historical_grad = historical_grad + grad_theta ** 2
+    else:
+        historical_grad = alpha * historical_grad + (1 - alpha) * (grad_theta ** 2)
+    adj_grad = npn.divide(grad_theta, fudge_factor+np.sqrt(historical_grad))
+    theta = theta + step_size * adj_grad 
+
+print(np.mean(theta, axis=0), 'manual')
